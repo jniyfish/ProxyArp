@@ -53,6 +53,7 @@ import org.onosproject.net.flow.FlowRuleService;
 import org.onosproject.net.flowobjective.FlowObjectiveService;
 import org.onosproject.net.flowobjective.DefaultForwardingObjective;
 import org.onosproject.net.flowobjective.ForwardingObjective;
+import org.onosproject.net.packet.DefaultOutboundPacket;
 import org.onosproject.net.packet.PacketContext;
 import org.onosproject.net.packet.PacketPriority;
 import org.onosproject.net.packet.PacketProcessor;
@@ -60,8 +61,17 @@ import org.onosproject.net.packet.PacketService;
 import org.onosproject.net.packet.InboundPacket;
 import java.util.Dictionary;
 import java.util.Properties;
+import org.onosproject.net.ConnectPoint;
+import org.onosproject.net.edge.EdgePortEvent;
+import org.onosproject.net.edge.EdgePortListener;
+import org.onosproject.net.edge.EdgePortService;
+import org.onlab.packet.Ip4Address;
+import org.onlab.packet.IpAddress;
 import static org.onlab.util.Tools.get;
 import com.google.common.collect.Maps;
+import org.onlab.packet.ARP;
+import java.nio.ByteBuffer;
+
 import java.util.Map;
 import java.util.HashMap;
 /**
@@ -78,34 +88,54 @@ public class AppComponent {
     private String someProperty;
     @Reference(cardinality = ReferenceCardinality.MANDATORY)
     protected ComponentConfigService cfgService;
-    private ApplicationId appId;
+
     @Reference(cardinality = ReferenceCardinality.MANDATORY)
     private FlowObjectiveService flowObjectiveService;
-    private Map<DeviceId, Map<MacAddress, PortNumber>> macTables = Maps.newConcurrentMap();
+
     @Reference(cardinality = ReferenceCardinality.MANDATORY)
     protected FlowRuleService flowRuleService;
+
     @Reference(cardinality = ReferenceCardinality.MANDATORY)
     protected CoreService coreService;
-    private  PacketProcessor processor ;
+
     @Reference(cardinality = ReferenceCardinality.MANDATORY)
     protected PacketService packetService;
+
+    @Reference(cardinality = ReferenceCardinality.MANDATORY)
+    protected EdgePortService edgeService;
+    private ReactivePacketProcessor processor = new ReactivePacketProcessor();
+    private static HashMap<Ip4Address,ConnectPoint	> mc;
+    private static HashMap<Ip4Address,MacAddress> mi;
+    int i=0;
+    private ApplicationId appId;
     @Activate
     protected void activate() {
         cfgService.registerProperties(getClass());
         appId = coreService.registerApplication("nctu.winlab.bridge");
-        processor = new ReactivePacketProcessor();
         packetService.addProcessor(processor, PacketProcessor.director(2));
         requestIntercepts();
+        mc =new HashMap<Ip4Address, ConnectPoint>();
+        mi =new HashMap<Ip4Address,MacAddress>();
+
     }
     @Deactivate
     protected void deactivate() {
         cfgService.unregisterProperties(getClass(), false);
         packetService.removeProcessor(processor);
+        withdrawIntercepts();
         processor=null;
+    }
+    
+    @Modified
+    public void modified(ComponentContext context) {
+        Dictionary<?, ?> properties = context != null ? context.getProperties() : new Properties();
+        if (context != null) {
+            someProperty = get(properties, "someProperty");
+        }
+        log.info("Reconfigured");
     }
 
     private class ReactivePacketProcessor implements PacketProcessor {
-
     @Override
         public void process(PacketContext context) {
             if (context.isHandled()) {
@@ -116,51 +146,64 @@ public class AppComponent {
             if (ethPkt == null) {
                 return;
             }
-            ConnectPoint cp =context.inPacket().receivedFrom();
-            MacAddress srcMac = ethPkt.getSourceMAC();
-            MacAddress dstMac = ethPkt.getDestinationMAC();
-            macTables.putIfAbsent(cp.deviceId(), Maps.newConcurrentMap());
-            Map<MacAddress, PortNumber> macTable = macTables.get(cp.deviceId()); 
-            if(macTable.get(srcMac)==null){
-                macTable.put(srcMac,cp.port());
+            Ip4Address srcIP = Ip4Address.valueOf​(((ARP)ethPkt.getPayload()).getSenderProtocolAddress());
+            Ip4Address dstIP = Ip4Address.valueOf​(((ARP)ethPkt.getPayload()).getTargetProtocolAddress());
+            if(mi.get(srcIP) == null){ //learn MAC mapping
+                log.info("put {},{} in table",srcIP.toString(),ethPkt.getSourceMAC().toString());
+                mi.put(srcIP,ethPkt.getSourceMAC());
+                mc.put(srcIP,context.inPacket().receivedFrom());
             }
-            PortNumber outPort = macTable.get(dstMac);
-            if(outPort==null){
-                packetOut(context, PortNumber.FLOOD);
-                return;
+            if(mi.get(dstIP)==null){
+                log.info("flood packet");
+                for(ConnectPoint p : edgeService.getEdgePoints()){
+                    if(p == context.inPacket().receivedFrom())
+                        continue;
+                    send(p,pkt);
+                }
             }
-            else{
-                installRule(context, srcMac, dstMac,outPort);
-            }  
+            if(mi.get(dstIP)!=null && ((ARP)ethPkt.getPayload()).getOpCode()==(short)1){
+                log.info("ARP supression");
+                Ethernet reply = (ARP.buildArpReply(dstIP,mi.get(dstIP),ethPkt));
+                TrafficTreatment.Builder builder = DefaultTrafficTreatment.builder();
+                ConnectPoint sourcePoint = context.inPacket().receivedFrom();
+                builder.setOutput(sourcePoint.port());
+                context.block();
+                packetService.emit(new DefaultOutboundPacket(sourcePoint.deviceId(),
+                        builder.build(), ByteBuffer.wrap(reply.serialize())));
+            }
+            else if(mi.get(dstIP)!=null && ((ARP)ethPkt.getPayload()).getOpCode()==(short)2){
+                log.info("unicast");
+                TrafficTreatment.Builder builder = DefaultTrafficTreatment.builder();
+                builder.setOutput(mc.get(dstIP).port());
+                context.block();
+                packetService.emit(new DefaultOutboundPacket(mc.get(dstIP).deviceId(),
+                        builder.build(), pkt.unparsed()));
+            }
         }
     }
     private void packetOut(PacketContext context, PortNumber portNumber) {
         context.treatmentBuilder().setOutput(portNumber);
         context.send();
     }
-    private void installRule(PacketContext context, MacAddress srcMac,MacAddress dstMac,PortNumber outport){
-        Ethernet inPkt = context.inPacket().parsed();
-        TrafficSelector.Builder selectorBuilder = DefaultTrafficSelector.builder();
-        selectorBuilder.matchEthDst(dstMac);
-        TrafficTreatment treatment = DefaultTrafficTreatment.builder().setOutput(outport).build();
-        ForwardingObjective forwardingObjective = DefaultForwardingObjective.builder()
-                    .withSelector(selectorBuilder.build())
-                    .withTreatment(treatment)
-                    .withPriority(20)
-                    .withFlag(ForwardingObjective.Flag.VERSATILE)
-                    .fromApp(appId)
-                    .makeTemporary(20) 
-                    .add();
-            flowObjectiveService.forward(context.inPacket().receivedFrom().deviceId(), forwardingObjective);
-          
-    }
     private void requestIntercepts() {
         TrafficSelector.Builder selector = DefaultTrafficSelector.builder();
         selector.matchEthType(Ethernet.TYPE_ARP);
         packetService.requestPackets(selector.build(), PacketPriority.REACTIVE, appId);
-
-        selector.matchEthType(Ethernet.TYPE_IPV4);
-        packetService.requestPackets(selector.build(), PacketPriority.REACTIVE, appId);
-
+    }
+    private void send(ConnectPoint p, InboundPacket pkt) {    
+        TrafficTreatment.Builder builder = DefaultTrafficTreatment.builder();
+        builder.setOutput(p.port());
+        packetService.emit(
+            new DefaultOutboundPacket(
+            p.deviceId(),
+            builder.build(),
+            pkt.unparsed()
+            )
+        );
+    }
+    private void withdrawIntercepts() {
+        TrafficSelector.Builder selector = DefaultTrafficSelector.builder();
+        selector.matchEthType(Ethernet.TYPE_ARP);
+        packetService.cancelPackets(selector.build(), PacketPriority.REACTIVE, appId);
     }
 }
