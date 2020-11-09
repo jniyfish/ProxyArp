@@ -154,7 +154,7 @@ public class AppComponent {
                 mc.put(srcIP,context.inPacket().receivedFrom());
             }
             if(mi.get(dstIP)==null){
-                log.info("flood packet");
+                log.info("TABLE MISS. Send request to edge ports");
                 for(ConnectPoint p : edgeService.getEdgePoints()){
                     if(p == context.inPacket().receivedFrom())
                         continue;
@@ -162,7 +162,7 @@ public class AppComponent {
                 }
             }
             if(mi.get(dstIP)!=null && ((ARP)ethPkt.getPayload()).getOpCode()==(short)1){
-                log.info("ARP supression");
+                log.info("TABLE HIT Requested MAC = {}",mi.get(dstIP).toString());
                 Ethernet reply = (ARP.buildArpReply(dstIP,mi.get(dstIP),ethPkt));
                 TrafficTreatment.Builder builder = DefaultTrafficTreatment.builder();
                 ConnectPoint sourcePoint = context.inPacket().receivedFrom();
@@ -172,7 +172,7 @@ public class AppComponent {
                         builder.build(), ByteBuffer.wrap(reply.serialize())));
             }
             else if(mi.get(dstIP)!=null && ((ARP)ethPkt.getPayload()).getOpCode()==(short)2){
-                log.info("unicast");
+                log.info("RECV REPLY Requested MAC = {}",mi.get(dstIP).toString());
                 TrafficTreatment.Builder builder = DefaultTrafficTreatment.builder();
                 builder.setOutput(mc.get(dstIP).port());
                 context.block();
